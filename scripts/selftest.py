@@ -8,11 +8,13 @@
 2. 正 TTL 到期后按权威现状重查（改址生效）
 3. 删除记录 -> NXDOMAIN 按 SOA 负缓存期限失效
 4. 负缓存期间恢复记录，TTL 内仍 NXDOMAIN；到期后拿到新 A
-5. 回源失败（权威静默丢包）：不沿用过期答复、不缓存 NXDOMAIN、回 SERVFAIL
-6. 同名并发冷查询只回源一次（singleflight），且各自 DNS ID 正确
-7. 单个等待者超时不取消回源、不影响其他等待者
-8. 慢域名不阻塞另一域名
-9. 解析器重启后缓存为空（由 scripts/selftest.sh 控制重启并调用 --restart-check）
+5. 零秒负缓存 TTL：NXDOMAIN 不进缓存、立刻重查重新回源、补回记录立即生效、
+   零秒 NXDOMAIN 单飞的等待者仍拿到本航班答复（各自 DNS ID）
+6. 回源失败（权威静默丢包）：不沿用过期答复、不缓存 NXDOMAIN、回 SERVFAIL
+7. 同名并发冷查询只回源一次（singleflight），且各自 DNS ID 正确
+8. 单个等待者超时不取消回源、不影响其他等待者
+9. 慢域名不阻塞另一域名
+10. 解析器重启后缓存为空（由 scripts/selftest.sh 控制重启并调用 --restart-check）
 """
 import json
 import os
@@ -113,8 +115,8 @@ def answers_of(reply):
 
 
 def restart_check():
-    """阶段 9：重启后的解析器必须没有任何旧缓存。"""
-    print("\n== 9. 解析器重启后不得沿用旧缓存 ==")
+    """阶段 10：重启后的解析器必须没有任何旧缓存。"""
+    print("\n== 10. 解析器重启后不得沿用旧缓存 ==")
     snap = stats("")  # name='' 时返回全量
     with urllib.request.urlopen(
         f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
@@ -208,7 +210,69 @@ def main():
           reply8 is not None and reply8.header.rcode == RCODE.NOERROR
           and answers_of(reply8) == ["10.0.0.12"], detail=str(answers_of(reply8) if reply8 else None))
 
-    print("\n== 5. 回源失败：不沿用过期答复 / 不缓存 NXDOMAIN / 回 SERVFAIL ==")
+    print("\n== 5. 零秒负缓存 TTL：NXDOMAIN 不进缓存、补回记录立即生效 ==")
+    set_neg_ttl(0)  # 网页把负缓存 TTL 设为 0
+    del_record(d1)
+    wait_until(POS_TTL + 3, "d1 旧缓存清空", lambda: not stats(d1).get("cached"))
+    base = stats(d1).get("upstream_attempts", 0)
+    rz1, iz1 = dns_query(d1, 3.0)
+    check("零秒负 TTL：查询回 NXDOMAIN 且 DNS ID 正确",
+          rz1 is not None and rz1.header.rcode == RCODE.NXDOMAIN and int(rz1.header.id) == iz1)
+    s = stats(d1)
+    check("零秒 NXDOMAIN 未进入可用缓存", not s.get("cached"), detail=str(s))
+    check("回源次数 +1", s.get("upstream_attempts") == base + 1, detail=str(s))
+    rz2, _ = dns_query(d1, 3.0)
+    check("立刻重查仍 NXDOMAIN 且重新回源（次数再 +1）",
+          rz2 is not None and rz2.header.rcode == RCODE.NXDOMAIN
+          and stats(d1).get("upstream_attempts") == base + 2, detail=str(stats(d1)))
+    set_record(d1, "10.0.0.13", POS_TTL)  # 补回记录
+    rz3, _ = dns_query(d1, 3.0)
+    check("补回记录后立刻拿到新 A 应答",
+          rz3 is not None and rz3.header.rcode == RCODE.NOERROR
+          and answers_of(rz3) == ["10.0.0.13"], detail=str(answers_of(rz3) if rz3 else None))
+    check("补回后回源次数再 +1", stats(d1).get("upstream_attempts") == base + 3,
+          detail=str(stats(d1)))
+
+    print("\n== 5b. 零秒负 TTL 下的同名单飞：等待者拿本航班答复 ==")
+    del_record(d1)
+    wait_until(POS_TTL + 3, "d1 正缓存到期", lambda: not stats(d1).get("cached"))
+    set_delay(d1, 1200)  # 让这一班回源持续约 1.2s，等待者能挂上同一 flight
+    base = stats(d1).get("upstream_attempts", 0)
+    zresults = []
+
+    def zworker():
+        r, i = dns_query(d1, 5.0)
+        zresults.append((r, i))
+
+    import threading
+    zfirst = threading.Thread(target=zworker)
+    zfirst.start()
+    wait_until(3, "零秒 flight 进入 inflight", lambda: stats(d1).get("inflight"))
+    zthreads = []
+    for _ in range(5):
+        t = threading.Thread(target=zworker)
+        zthreads.append(t)
+        t.start()
+    zfirst.join()
+    for t in zthreads:
+        t.join()
+    check("6 个并发查询全部拿到 NXDOMAIN 且各自 DNS ID 正确",
+          len(zresults) == 6 and all(r is not None and r.header.rcode == RCODE.NXDOMAIN
+                                     and int(r.header.id) == i for r, i in zresults),
+          detail=str([(int(r.header.id) if r else None, i) for r, i in zresults]))
+    check("零秒负 TTL 单飞只回源一次", stats(d1).get("upstream_attempts") == base + 1,
+          detail=str(stats(d1)))
+    check("零秒 NXDOMAIN 单飞后仍未进入缓存", not stats(d1).get("cached"), detail=str(stats(d1)))
+    set_delay(d1, 0)
+    rz4, _ = dns_query(d1, 3.0)
+    check("该班回源结束后首个新查询重新回源",
+          rz4 is not None and stats(d1).get("upstream_attempts") == base + 2,
+          detail=str(stats(d1)))
+    # 恢复现场，不影响后续用例
+    set_record(d1, "10.0.0.12", POS_TTL)
+    set_neg_ttl(NEG_TTL)
+
+    print("\n== 6. 回源失败：不沿用过期答复 / 不缓存 NXDOMAIN / 回 SERVFAIL ==")
     wait_until(POS_TTL + 3, "正缓存再次到期", lambda: not stats(d1).get("cached"))
     set_drop(d1, True)  # 权威对该域名静默丢包
     reply9, _ = dns_query(d1, 6.0)
@@ -229,7 +293,7 @@ def main():
           reply11 is not None and reply11.header.rcode == RCODE.NOERROR
           and answers_of(reply11) == ["10.0.0.12"], detail=str(answers_of(reply11) if reply11 else None))
 
-    print("\n== 6. 同名并发冷查询只回源一次，各自 DNS ID 正确 ==")
+    print("\n== 7. 同名并发冷查询只回源一次，各自 DNS ID 正确 ==")
     set_delay(d2, 1500)
     wait_until(POS_TTL + 3, "d2 缓存到期", lambda: not stats(d2).get("cached"))
     base = stats(d2).get("upstream_attempts", 0)
@@ -260,7 +324,7 @@ def main():
     check("同名冷查询只回源一次", stats(d2).get("upstream_attempts") == base + 1,
           detail=str(stats(d2)))
 
-    print("\n== 7. 单个等待者超时不取消回源、不影响其他等待者 ==")
+    print("\n== 8. 单个等待者超时不取消回源、不影响其他等待者 ==")
     set_delay(d2, 1200)
     wait_until(POS_TTL + 3, "d2 缓存到期", lambda: not stats(d2).get("cached"))
     base = stats(d2).get("upstream_attempts", 0)
@@ -286,7 +350,7 @@ def main():
           detail=str(stats(d2)))
     set_delay(d2, 0)
 
-    print("\n== 8. 慢域名不阻塞另一域名 ==")
+    print("\n== 9. 慢域名不阻塞另一域名 ==")
     set_delay(d2, 2500)
     wait_until(POS_TTL + 3, "d2 缓存到期", lambda: not stats(d2).get("cached"))
     t0 = time.time()
@@ -297,7 +361,7 @@ def main():
           detail=f"elapsed={elapsed:.2f}s")
     set_delay(d2, 0)
 
-    print("\n== 9 预备：制造缓存供重启验证 ==")
+    print("\n== 10 预备：制造缓存供重启验证 ==")
     set_record(d1, "10.0.0.10", POS_TTL)
     dns_query(d1, 3.0)
     check("重启前缓存确实存在", bool(stats(d1).get("cached")), detail=str(stats(d1)))

@@ -18,6 +18,12 @@ docker compose exec -T \
   -e WEB_BASE=http://127.0.0.1:8000 \
   -e RESOLVER_UDP_HOST=resolver -e RESOLVER_UDP_PORT=53 \
   -e RESOLVER_STATS_HOST=resolver -e RESOLVER_STATS_PORT=8081 \
+  web python -m scripts.selftest_zero_ttl
+
+docker compose exec -T \
+  -e WEB_BASE=http://127.0.0.1:8000 \
+  -e RESOLVER_UDP_HOST=resolver -e RESOLVER_UDP_PORT=53 \
+  -e RESOLVER_STATS_HOST=resolver -e RESOLVER_STATS_PORT=8081 \
   web python -m scripts.selftest
 
 echo ">> 重启 resolver 容器（无卷挂载，缓存应清空）"

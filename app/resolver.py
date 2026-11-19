@@ -2,6 +2,8 @@
 
 关键语义：
 1. 正缓存按 A 记录自身 TTL 失效；负缓存（NXDOMAIN）按权威 SOA 的 minimum 失效。
+   TTL 为 0（网页可把负缓存 TTL 显式设为 0）时该答复**不进入缓存**：
+   本次查询及其等待者仍能拿到它，但之后首个同名查询必须重新回源。
 2. 缓存到期后按权威“当前”状况重新回源；回源失败时：
    - 不沿用已过期的旧答复（无论正负）；
    - 不把失败缓存成 NXDOMAIN；
@@ -9,6 +11,9 @@
 3. 同名并发冷查询只回源一次（singleflight）：后来者在 Event 上等待同一次回源。
    某个等待者自己等超时只影响它自己（回 SERVFAIL），不会取消正在回源的 leader，
    也不影响其他等待者；每个客户端拿到的答复都换成自己查询的 DNS ID。
+   答复挂在 Flight 上随 Event 一起交给等待者，而不是让等待者回头读缓存——
+   因此即使该答复 TTL=0 未入缓存、或下一次回源已经覆盖了缓存，
+   等待者拿到的仍然是“自己等的这一次”回源的答复。
 4. 线程化 UDP + 按名单飞：慢域名的回源不会阻塞另一个域名的查询。
 5. 缓存只在进程内存中，不写磁盘；进程/容器重启后缓存为空。
 6. 附带 HTTP 状态接口（STATS_PORT）：每个名字的回源次数、缓存种类、剩余 TTL、
@@ -29,11 +34,18 @@ from . import config
 
 
 class Flight:
-    """一次正在进行的回源（同名并发查询共享）。"""
+    """一次正在进行的回源（同名并发查询共享）。
+
+    reply_entry：本次回源得到的答复（模板 id=0）。leader 在 set() 前写好，
+    等待者从 flight 上取“自己等的这一次”的答复，而不是回头查缓存——
+    这样 TTL=0 的答复（不进缓存）也能交给等待者，且不会被下一次回源
+    写入缓存的内容顶错。
+    """
 
     def __init__(self) -> None:
         self.event = threading.Event()
         self.error: Optional[str] = None
+        self.reply_entry: Optional["CacheEntry"] = None
         self.waiters = 0
         self.started_at = time.time()
 
@@ -90,11 +102,12 @@ class CachingResolver:
         for rr in resp.auth:
             if rr.rtype == QTYPE.SOA:
                 # SOA times: (serial, refresh, retry, expire, minimum)
-                return max(1, int(rr.rdata.times[4]))
+                # minimum 可以是 0（网页显式配置）：负缓存期限就是 0，即不缓存
+                return max(0, int(rr.rdata.times[4]))
         # 没有 SOA 时退回一个保守的小值，避免永久负缓存
         return 5
 
-    def _store_reply(self, key: str, qname: str, resp: DNSRecord) -> CacheEntry:
+    def _store_reply(self, key: str, qname: str, resp: DNSRecord, flight: Flight) -> CacheEntry:
         rcode = int(resp.header.rcode)
         resp.header.id = 0  # 模板去 ID，发出前逐客户端重写
 
@@ -112,8 +125,13 @@ class CachingResolver:
         else:
             raise ValueError(f"non-cacheable rcode {rcode}")
 
-        with self.lock:
-            self.cache[key] = entry
+        # 无论是否可缓存，本次答复都先挂到 flight 上：所有等待者都拿“这一份”
+        flight.reply_entry = entry
+        if entry.ttl > 0:
+            with self.lock:
+                self.cache[key] = entry
+        # TTL=0（例如网页把负缓存 TTL 设为 0 时的 NXDOMAIN）不进入缓存：
+        # 本次回源结束后，首个新到的同名查询必须重新问权威
         return entry
 
     # ---------- 应答构造 ----------
@@ -172,13 +190,14 @@ class CachingResolver:
             # 等待者：只等这一次回源；超时仅自己回 SERVFAIL，flight 仍由 leader 收尾
             signaled = flight.event.wait(timeout=config.UPSTREAM_TIMEOUT + 2.0)
             with self.lock:
-                entry = self.cache.get(key)
-                if entry is not None and entry.fresh():
-                    return self._from_entry(query, entry)
-                if signaled and flight.error is None and key not in self.inflight:
-                    # leader 正常结束却没有可缓存内容：按失败处理
-                    return self._servfail(query)
+                if flight.reply_entry is not None:
+                    # 关键：等待者拿“自己等的这次回源”的答复（换成自己的 DNS ID），
+                    # 即使它 TTL=0 没有进缓存，或下一次回源已经覆盖了缓存
+                    return self._from_entry(query, flight.reply_entry)
                 if flight.error is not None:
+                    return self._servfail(query)
+                if signaled:
+                    # leader 正常结束却既无答复也无错误：按失败处理
                     return self._servfail(query)
                 # 否则本轮等待超时，进入下一轮（不会取消任何其他等待者）
         return self._servfail(query)
@@ -189,7 +208,7 @@ class CachingResolver:
                 self.attempts[key] = self.attempts.get(key, 0) + 1
             resp = self._fetch_upstream(qname, qtype)
             try:
-                entry = self._store_reply(key, qname, resp)
+                entry = self._store_reply(key, qname, resp, flight)
             except ValueError as exc:
                 flight.error = str(exc)
                 with self.lock:

@@ -46,6 +46,11 @@ curl -sf http://127.0.0.1:8000/api/state >/dev/null || { echo "网页未就绪�
 WEB_BASE=http://127.0.0.1:8000 \
 RESOLVER_UDP_HOST=127.0.0.1 RESOLVER_UDP_PORT=5354 \
 RESOLVER_STATS_HOST=127.0.0.1 RESOLVER_STATS_PORT=8081 \
+"$PY" -m scripts.selftest_zero_ttl
+
+WEB_BASE=http://127.0.0.1:8000 \
+RESOLVER_UDP_HOST=127.0.0.1 RESOLVER_UDP_PORT=5354 \
+RESOLVER_STATS_HOST=127.0.0.1 RESOLVER_STATS_PORT=8081 \
 "$PY" -m scripts.selftest
 
 echo ">> 重启解析器，验证缓存不持久化"

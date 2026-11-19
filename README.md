@@ -58,25 +58,31 @@ scripts/selftest-local.sh        # 自动起三进程、跑自测、重启验证
 | --- | --- |
 | A 按记录 TTL 失效 | `resolver.CacheEntry.expiry = now + 应答最小 TTL`；命中时按剩余秒数重写 RR TTL |
 | NXDOMAIN 按 SOA 负缓存期限失效 | 权威 NXDOMAIN 带 SOA；解析器取 `SOA.minimum` 作为负缓存 TTL |
+| 负缓存 TTL = 0 时不缓存 | 零秒答复只交给本次查询及其单飞等待者，不写入缓存表；之后首个同名查询必重新回源（补回记录立即生效） |
 | 到期后按权威现况重查 | 缓存仅在 `fresh()` 时命中；过期即重新回源，不预先刷新 |
 | 回源失败不沿用过期答复 | 失败路径不写/不读缓存，直接 `SERVFAIL`；过期条目不会被返回 |
 | 回源失败不缓存为 NXDOMAIN | 仅缓存真实 `NOERROR`/`NXDOMAIN`/`NODATA`；超时/异常/SERVFAIL 一律不缓存 |
 | 同名并发冷查询只回源一次 | `inflight` 字典 + `threading.Event` 单飞；后来者在同一 Flight 上等待 |
+| 等待者拿“本航班”的答复 | 答复挂在 `Flight.reply_entry` 上随 Event 交付，等待者不回头读缓存：TTL=0 未入缓存、或下一班回源已覆盖缓存，等待者仍拿到自己等的那次答复 |
 | 单个请求超时不取消其他等待者 | 等待者超时只让自己回 SERVFAIL；leader 的回源 socket 与 Event 不受影响 |
-| 答复对应各自 DNS ID | 缓存模板 `id=0`，发出前用每个客户端自己的查询 ID 重写（自测逐包校验） |
+| 答复对应各自 DNS ID | 缓存/航班模板 `id=0`，发出前用每个客户端自己的查询 ID 重写（自测逐包校验） |
 | 慢域名不阻塞另一域名 | 权威与解析器均为线程化 UDP，单飞按域名分键 |
 | 重启后不沿用旧缓存 | 缓存纯内存、容器无数据卷；`--restart-check` 自测验证计数与缓存归零 |
 
 ## 自测
 
 ```bash
-scripts/selftest.sh           # Docker Compose 环境：33 项端到端断言 + 重启验证
+scripts/selftest.sh           # Docker Compose 环境：进程内单测 + 端到端断言 + 重启验证
 scripts/selftest-local.sh     # 本地三进程等价跑法（本仓库即以此验证）
 ```
 
-覆盖 9 组场景：冷查询/缓存命中、正 TTL 到期改址、NXDOMAIN 负缓存、
-负缓存期内恢复记录、回源失败（SERVFAIL、不缓存、不沿用）、8 路同名单飞、
+覆盖 10 组场景：冷查询/缓存命中、正 TTL 到期改址、NXDOMAIN 负缓存、
+负缓存期内恢复记录、**零秒负缓存 TTL（不缓存、补回记录立即生效、零秒单飞等待者拿本航班答复）**、
+回源失败（SERVFAIL、不缓存、不沿用）、8 路同名单飞、
 等待者超时隔离、慢域名互不阻塞、重启缓存清空。
+另有 `scripts/selftest_zero_ttl.py` 进程内确定性单测：用受控假上游驱动
+`CachingResolver`，验证零秒 NXDOMAIN 不进缓存、立刻重查重新回源、
+等待者在本航班结束后（即使下一班已写入新缓存）仍拿到本航班的 NXDOMAIN 与各自 DNS ID。
 
 ## 目录
 
@@ -90,6 +96,7 @@ app/
   static/index.html  操作网页
 scripts/
   selftest.py        端到端断言（真实 UDP）
+  selftest_zero_ttl.py  零秒负缓存进程内确定性单测
   selftest.sh        compose 跑法
   selftest-local.sh  本地进程跑法
 docker-compose.yml   authoritative / resolver / web 三服务
